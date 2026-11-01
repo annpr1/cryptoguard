@@ -1,111 +1,109 @@
 #include "cmd_options.h"
 #include "crypto_guard_ctx.h"
-#include <algorithm>
-#include <array>
+
+#include <filesystem>
+#include <fstream>
 #include <iostream>
-#include <openssl/evp.h>
-#include <print>
 #include <stdexcept>
-#include <string>
 
-struct AesCipherParams {
-    static const size_t KEY_SIZE = 32;             // AES-256 key size
-    static const size_t IV_SIZE = 16;              // AES block size (IV length)
-    const EVP_CIPHER *cipher = EVP_aes_256_cbc();  // Cipher algorithm
+namespace fs = std::filesystem;
 
-    int encrypt;                              // 1 for encryption, 0 for decryption
-    std::array<unsigned char, KEY_SIZE> key;  // Encryption key
-    std::array<unsigned char, IV_SIZE> iv;    // Initialization vector
-};
-
-AesCipherParams CreateChiperParamsFromPassword(std::string_view password) {
-    AesCipherParams params;
-    constexpr std::array<unsigned char, 8> salt = {'1', '2', '3', '4', '5', '6', '7', '8'};
-
-    int result = EVP_BytesToKey(params.cipher, EVP_sha256(), salt.data(),
-                                reinterpret_cast<const unsigned char *>(password.data()), password.size(), 1,
-                                params.key.data(), params.iv.data());
-
-    if (result == 0) {
-        throw std::runtime_error{"Failed to create a key from password"};
+class TemporaryOutput {
+public:
+    explicit TemporaryOutput(const fs::path &target) : directory_(target.string() + ".tmp") {
+        if (!fs::create_directory(directory_)) {
+            throw std::runtime_error("Temporary directory already exists: " + directory_.string());
+        }
     }
 
-    return params;
+    ~TemporaryOutput() {
+        std::error_code error;
+        fs::remove(GetPath(), error);
+        fs::remove(directory_, error);
+    }
+
+    TemporaryOutput(const TemporaryOutput &) = delete;
+    TemporaryOutput &operator=(const TemporaryOutput &) = delete;
+
+    fs::path GetPath() const { return directory_ / "result"; }
+
+private:
+    fs::path directory_;
+};
+
+void CloseInput(std::fstream &input) {
+    input.clear();
+    input.close();
+    if (input.fail()) {
+        throw std::runtime_error("Failed to close input file");
+    }
 }
 
 int main(int argc, char *argv[]) {
     try {
-        //
-        // OpenSSL пример использования:
-        //
-        std::string input = "01234567890123456789";
-        std::string output;
-
-        OpenSSL_add_all_algorithms();
-
-        auto params = CreateChiperParamsFromPassword("12341234");
-        params.encrypt = 1;
-        auto *ctx = EVP_CIPHER_CTX_new();
-
-        // Инициализируем cipher
-        EVP_CipherInit_ex(ctx, params.cipher, nullptr, params.key.data(), params.iv.data(), params.encrypt);
-
-        std::vector<unsigned char> outBuf(16 + EVP_MAX_BLOCK_LENGTH);
-        std::vector<unsigned char> inBuf(16);
-        int outLen;
-
-        // Обрабатываем первые N символов
-        std::copy(input.begin(), std::next(input.begin(), 16), inBuf.begin());
-        EVP_CipherUpdate(ctx, outBuf.data(), &outLen, inBuf.data(), static_cast<int>(16));
-        for (int i = 0; i < outLen; ++i) {
-            output.push_back(outBuf[i]);
-        }
-
-        // Обрабатываем оставшиеся символы
-        std::copy(std::next(input.begin(), 16), input.end(), inBuf.begin());
-        EVP_CipherUpdate(ctx, outBuf.data(), &outLen, inBuf.data(), static_cast<int>(input.size() - 16));
-        for (int i = 0; i < outLen; ++i) {
-            output.push_back(outBuf[i]);
-        }
-
-        // Заканчиваем работу с cipher
-        EVP_CipherFinal_ex(ctx, outBuf.data(), &outLen);
-        for (int i = 0; i < outLen; ++i) {
-            output.push_back(outBuf[i]);
-        }
-        EVP_CIPHER_CTX_free(ctx);
-        std::print("String encoded successfully. Result: '{}'\n\n", output);
-        EVP_cleanup();
-        //
-        // Конец примера
-        //
-
         CryptoGuard::ProgramOptions options;
-
-        CryptoGuard::CryptoGuardCtx cryptoCtx;
-
-        using COMMAND_TYPE = CryptoGuard::ProgramOptions::COMMAND_TYPE;
-        switch (options.GetCommand()) {
-        case COMMAND_TYPE::ENCRYPT:
-            std::print("File encoded successfully\n");
-            break;
-
-        case COMMAND_TYPE::DECRYPT:
-            std::print("File decoded successfully\n");
-            break;
-
-        case COMMAND_TYPE::CHECKSUM:
-            std::print("Checksum: {}\n", "CHECKSUM_NOT_IMPLEMENTED");
-            break;
-
-        default:
-            throw std::runtime_error{"Unsupported command"};
+        options.Parse(argc, argv);
+        if (options.IsHelp()) {
+            return 0;
         }
 
-    } catch (const std::exception &e) {
-        std::print(std::cerr, "Error: {}\n", e.what());
+        std::fstream input(options.GetInputFile(), std::ios::in | std::ios::binary);
+        if (!input.is_open()) {
+            throw std::runtime_error("Cannot open input: " + options.GetInputFile());
+        }
+        if (!fs::is_regular_file(options.GetInputFile())) {
+            throw std::runtime_error("Input must be a regular file");
+        }
+
+        CryptoGuard::CryptoGuardCtx crypto;
+        using Command = CryptoGuard::ProgramOptions::COMMAND_TYPE;
+        auto command = options.GetCommand();
+        auto outputPath = options.GetOutputFile();
+        if (command == Command::CHECKSUM && outputPath.empty()) {
+            auto checksum = crypto.CalculateChecksum(input);
+            CloseInput(input);
+            std::cout << checksum << '\n';
+            std::cout.flush();
+            if (!std::cout) {
+                throw std::runtime_error("Failed to print checksum");
+            }
+            return 0;
+        }
+
+        if (fs::exists(fs::symlink_status(outputPath))) {
+            throw std::runtime_error("Output already exists: choose another path");
+        }
+        TemporaryOutput temporary(outputPath);
+        fs::permissions(temporary.GetPath().parent_path(), fs::perms::owner_all);
+        std::fstream output(temporary.GetPath(), std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            throw std::runtime_error("Cannot open output file");
+        }
+
+        switch (command) {
+        case Command::ENCRYPT:
+            crypto.EncryptFile(input, output, options.GetPassword());
+            break;
+        case Command::DECRYPT:
+            crypto.DecryptFile(input, output, options.GetPassword());
+            break;
+        case Command::CHECKSUM:
+            output << crypto.CalculateChecksum(input) << '\n';
+            break;
+        }
+        output.flush();
+        if (!output) {
+            throw std::runtime_error("Failed to flush output file");
+        }
+        output.close();
+        if (output.fail()) {
+            throw std::runtime_error("Failed to close output file");
+        }
+        CloseInput(input);
+        fs::create_hard_link(temporary.GetPath(), outputPath);
+        std::cout << "Done\n";
+    } catch (const std::exception &error) {
+        std::cerr << "Error: " << error.what() << '\n';
         return 1;
     }
-
-    return 0;
 }
